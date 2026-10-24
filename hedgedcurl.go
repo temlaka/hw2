@@ -16,19 +16,31 @@ import (
 const timeoutExitCode = 228
 
 type Result struct {
-	URL  string
-	Resp *http.Response
-	Err  error
+	Index int
+	URL   string
+	Resp  *http.Response
+	Err   error
 }
 
-func curl2(ctx context.Context, client *http.Client, url string) Result {
+func curl(ctx context.Context, client *http.Client, index int, url string) Result {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return Result{URL: url, Err: err}
+		return Result{Index: index, URL: url, Err: err}
 	}
 
 	resp, err := client.Do(req)
-	return Result{URL: url, Resp: resp, Err: err}
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return Result{Index: index, URL: url, Err: err}
+	}
+
+	return Result{
+		Index: index,
+		URL:   url,
+		Resp:  resp,
+	}
 }
 
 func isTimeout(err error) bool {
@@ -43,77 +55,115 @@ func isTimeout(err error) bool {
 func printResponse(resp *http.Response) error {
 	defer resp.Body.Close()
 
-	fmt.Printf("%s %s\n", resp.Proto, resp.Status)
-
-	keys := make([]string, 0, len(resp.Header))
-	for k := range resp.Header {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		for _, v := range resp.Header[k] {
-			fmt.Printf("%s: %s\n", k, v)
-		}
-	}
-
-	fmt.Println()
-
+	// Сначала читаем тело целиком, чтобы не выводить
+	// неполный ответ, если чтение завершится ошибкой.
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("ошибка чтения тела ответа: %w", err)
 	}
 
-	fmt.Print(string(body))
+	fmt.Printf("%s %s\n", resp.Proto, resp.Status)
+
+	keys := make([]string, 0, len(resp.Header))
+	for key := range resp.Header {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		for _, value := range resp.Header[key] {
+			fmt.Printf("%s: %s\n", key, value)
+		}
+	}
+
+	fmt.Println()
+	_, err = os.Stdout.Write(body)
+	if err != nil {
+		return fmt.Errorf("ошибка вывода тела ответа: %w", err)
+	}
+
 	return nil
 }
 
 func run() int {
 	var timeoutSeconds int
+	var showHelp bool
 
-	flag.IntVar(&timeoutSeconds, "t", 15, "таймаут запросов в секундах")
-	flag.IntVar(&timeoutSeconds, "timeout", 15, "таймаут запросов в секундах")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Использование: %s [флаги] URL...\n", os.Args[0])
-		flag.PrintDefaults()
+	fs := flag.NewFlagSet("hedgedcurl", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	fs.IntVar(&timeoutSeconds, "t", 15, "таймаут запросов в секундах")
+	fs.IntVar(&timeoutSeconds, "timeout", 15, "таймаут запросов в секундах")
+	fs.BoolVar(&showHelp, "h", false, "показать справку")
+	fs.BoolVar(&showHelp, "help", false, "показать справку")
+
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Использование: %s [флаги] URL...\n\n", os.Args[0])
+		fmt.Fprintln(fs.Output(), "Выполняет параллельные HTTP GET-запросы и выводит первый успешный HTTP-ответ.")
+		fmt.Fprintln(fs.Output(), "\nФлаги:")
+		fs.PrintDefaults()
 	}
-	flag.Parse()
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+
+	if showHelp {
+		fs.Usage()
+		return 0
+	}
 
 	if timeoutSeconds <= 0 {
 		fmt.Fprintln(os.Stderr, "Ошибка: таймаут должен быть больше 0")
 		return 1
 	}
 
-	urls := flag.Args()
+	urls := fs.Args()
 	if len(urls) == 0 {
 		fmt.Fprintln(os.Stderr, "Ошибка: укажите хотя бы один URL")
-		flag.Usage()
+		fs.Usage()
 		return 1
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	client := &http.Client{
-		Timeout: time.Duration(timeoutSeconds) * time.Second,
-	}
+	timeout := time.Duration(timeoutSeconds) * time.Second
+	client := &http.Client{}
 
 	results := make(chan Result, len(urls))
+	cancels := make([]context.CancelFunc, len(urls))
 
-	for _, url := range urls {
-		go func(url string) {
-			results <- curl2(ctx, client, url)
-		}(url)
+	// Запускаем все запросы параллельно.
+	for i, url := range urls {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		cancels[i] = cancel
+
+		go func(index int, url string, ctx context.Context) {
+			results <- curl(ctx, client, index, url)
+		}(i, url, ctx)
 	}
+
+	defer func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+	}()
 
 	timeoutOccurred := false
 
+	// Продолжаем, пока не получим HTTP-ответ
+	// или пока не завершатся все запросы с ошибками.
 	for range urls {
 		result := <-results
 
 		if result.Err != nil {
-			fmt.Fprintf(os.Stderr, "Ошибка запроса %s: %v\n",
-				result.URL, result.Err)
+			fmt.Fprintf(
+				os.Stderr,
+				"Ошибка запроса %s: %v\n",
+				result.URL,
+				result.Err,
+			)
 
 			if isTimeout(result.Err) {
 				timeoutOccurred = true
@@ -121,12 +171,22 @@ func run() int {
 			continue
 		}
 
-		// Получен первый HTTP-ответ.
-		// Отменяем остальные запросы.
-		cancel()
+		// Получили HTTP-ответ. Отменяем остальные запросы,
+		// но оставляем выбранный запрос активным до чтения тела.
+		for i, cancel := range cancels {
+			if i != result.Index {
+				cancel()
+			}
+		}
 
-		if err := printResponse(result.Resp); err != nil {
+		err := printResponse(result.Resp)
+		cancels[result.Index]()
+
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
+			if isTimeout(err) {
+				return timeoutExitCode
+			}
 			return 1
 		}
 
@@ -138,6 +198,7 @@ func run() int {
 	if timeoutOccurred {
 		return timeoutExitCode
 	}
+
 	return 1
 }
 
