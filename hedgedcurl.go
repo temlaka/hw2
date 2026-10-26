@@ -18,8 +18,9 @@ const timeoutExitCode = 228
 type Result struct {
 	Index int
 	URL   string
-	Resp  *http.Response
+	Body  []byte
 	Err   error
+	Resp  *http.Response
 }
 
 func curl(ctx context.Context, client *http.Client, index int, url string) Result {
@@ -36,10 +37,21 @@ func curl(ctx context.Context, client *http.Client, index int, url string) Resul
 		return Result{Index: index, URL: url, Err: err}
 	}
 
+	defer resp.Body.Close()
+
+	// Сначала читаем тело целиком, чтобы не выводить
+	// неполный ответ, если чтение завершится ошибкой.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+
+		return Result{Index: index, URL: url, Err: err}
+	}
+
 	return Result{
 		Index: index,
 		URL:   url,
 		Resp:  resp,
+		Body:  body,
 	}
 }
 
@@ -52,15 +64,7 @@ func isTimeout(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-func printResponse(resp *http.Response) error {
-	defer resp.Body.Close()
-
-	// Сначала читаем тело целиком, чтобы не выводить
-	// неполный ответ, если чтение завершится ошибкой.
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("ошибка чтения тела ответа: %w", err)
-	}
+func printResponse(resp *http.Response, body []byte) error {
 
 	fmt.Printf("%s %s\n", resp.Proto, resp.Status)
 
@@ -77,7 +81,7 @@ func printResponse(resp *http.Response) error {
 	}
 
 	fmt.Println()
-	_, err = os.Stdout.Write(body)
+	_, err := os.Stdout.Write(body)
 	if err != nil {
 		return fmt.Errorf("ошибка вывода тела ответа: %w", err)
 	}
@@ -179,7 +183,7 @@ func run() int {
 			}
 		}
 
-		err := printResponse(result.Resp)
+		err := printResponse(result.Resp, result.Body)
 		cancels[result.Index]()
 
 		if err != nil {
